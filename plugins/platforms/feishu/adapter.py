@@ -370,22 +370,24 @@ class FeishuAdapterSettings:
     verification_token: str
     group_policy: str
     allowed_group_users: frozenset[str]
+    require_mention: bool
+    free_response_chats: frozenset[str] = field(default_factory=frozenset)
     # Bot's own open_id (app-scoped) — returned by /bot/v3/info.  Used only for
     # @mention matching: Feishu puts this value in mentions[].id.open_id when
     # a user @-mentions the bot in a group chat.
-    bot_open_id: str
+    bot_open_id: str = ""
     # Bot's user_id (tenant-scoped) — optional, used as fallback mention match.
-    bot_user_id: str
-    bot_name: str
-    dedup_cache_size: int
-    text_batch_delay_seconds: float
-    text_batch_split_delay_seconds: float
-    text_batch_max_messages: int
-    text_batch_max_chars: int
-    media_batch_delay_seconds: float
-    webhook_host: str
-    webhook_port: int
-    webhook_path: str
+    bot_user_id: str = ""
+    bot_name: str = ""
+    dedup_cache_size: int = 0
+    text_batch_delay_seconds: float = 0.0
+    text_batch_split_delay_seconds: float = 0.0
+    text_batch_max_messages: int = 0
+    text_batch_max_chars: int = 0
+    media_batch_delay_seconds: float = 0.0
+    webhook_host: str = ""
+    webhook_port: int = 0
+    webhook_path: str = ""
     ws_reconnect_nonce: int = 30
     ws_reconnect_interval: int = 120
     ws_ping_interval: Optional[int] = None
@@ -541,6 +543,30 @@ def _coerce_int(value: Any, default: Optional[int] = None, min_value: int = 0) -
 def _coerce_required_int(value: Any, default: int, min_value: int = 0) -> int:
     parsed = _coerce_int(value, default=default, min_value=min_value)
     return default if parsed is None else parsed
+
+
+def _coerce_bool(value: Any, default: bool) -> bool:
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return default
+    normalized = str(value).strip().lower()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+    return default
+
+
+def _coerce_str_set(value: Any) -> frozenset[str]:
+    if value is None:
+        return frozenset()
+    if isinstance(value, (list, tuple, set, frozenset)):
+        return frozenset(str(item).strip() for item in value if str(item).strip())
+    raw = str(value).strip()
+    if not raw:
+        return frozenset()
+    return frozenset(item.strip() for item in raw.split(",") if item.strip())
 
 
 # ---------------------------------------------------------------------------
@@ -1531,6 +1557,10 @@ class FeishuAdapter(BasePlatformAdapter):
                 for item in os.getenv("FEISHU_ALLOWED_USERS", "").split(",")
                 if item.strip()
             ),
+            require_mention=_coerce_bool(extra.get("require_mention"), default=True),
+            free_response_chats=_coerce_str_set(
+                extra.get("free_response_chats") or extra.get("free_response_channels")
+            ),
             bot_open_id=os.getenv("FEISHU_BOT_OPEN_ID", "").strip(),
             bot_user_id=os.getenv("FEISHU_BOT_USER_ID", "").strip(),
             bot_name=os.getenv("FEISHU_BOT_NAME", "").strip(),
@@ -1573,9 +1603,6 @@ class FeishuAdapter(BasePlatformAdapter):
             default_group_policy=default_group_policy,
             group_rules=group_rules,
             allow_bots=allow_bots,
-            require_mention=_to_boolean(
-                extra.get("require_mention", os.getenv("FEISHU_REQUIRE_MENTION", "true"))
-            ),
         )
 
     def _apply_settings(self, settings: FeishuAdapterSettings) -> None:
@@ -1587,6 +1614,8 @@ class FeishuAdapter(BasePlatformAdapter):
         self._verification_token = settings.verification_token
         self._group_policy = settings.group_policy
         self._allowed_group_users = set(settings.allowed_group_users)
+        self._require_mention = settings.require_mention
+        self._free_response_chats = set(settings.free_response_chats)
         self._admins = set(settings.admins)
         self._default_group_policy = settings.default_group_policy or settings.group_policy
         self._group_rules = settings.group_rules
@@ -1828,6 +1857,57 @@ class FeishuAdapter(BasePlatformAdapter):
         except Exception as exc:
             logger.error("[Feishu] Send error: %s", exc, exc_info=True)
             return SendResult(success=False, error=str(exc))
+
+    async def send_with_stats_footer(
+        self,
+        chat_id: str,
+        content: str,
+        reply_to: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+        *,
+        model: str = "",
+        duration: float = 0,
+        api_calls: int = 0,
+        input_tokens: int = 0,
+        output_tokens: int = 0,
+        context_limit: int = 125000,
+    ) -> SendResult:
+        """Send a Feishu message, then append a stats footer as a separate message."""
+        # 1. Send the main content
+        result = await self.send(chat_id, content, reply_to=reply_to, metadata=metadata)
+        if not result.success:
+            return result
+
+        # 2. Build footer text
+        footer_lines = []
+        if model:
+            footer_lines.append(f"🤖 {model}")
+        if duration > 0:
+            footer_lines.append(f"⏱ {duration:.1f}s")
+        if api_calls > 0:
+            footer_lines.append(f"📡 API {api_calls}次")
+        if input_tokens > 0 or output_tokens > 0:
+            total = input_tokens + output_tokens
+            total_k = total / 1000
+            footer_lines.append(f"💬 {total_k:.1f}k tokens")
+            if context_limit > 0:
+                pct = total / context_limit * 100
+                footer_lines.append(f"   [{pct:.1f}%]")
+            if input_tokens > 0:
+                footer_lines.append(f"   ▲ {input_tokens/1000:.1f}k in")
+            if output_tokens > 0:
+                footer_lines.append(f"   ▼ {output_tokens/1000:.1f}k out")
+
+        if not footer_lines:
+            return result
+
+        footer_text = "\n".join(footer_lines)
+        # Small delay to ensure footer arrives after main message
+        await asyncio.sleep(0.3)
+        footer_result = await self.send(chat_id, footer_text, reply_to=None, metadata=None)
+        if not footer_result.success:
+            logger.warning("[Feishu] Stats footer send failed: %s", footer_result.error)
+        return result
 
     async def edit_message(
         self,
@@ -4179,10 +4259,15 @@ class FeishuAdapter(BasePlatformAdapter):
 
         return bool(sender_ids and (sender_ids & self._allowed_group_users))
 
-    # --- Mention detection ----------------------------------------------------
-
-    def _mentions_self(self, message: Any) -> bool:
-        # @_all is Feishu's @everyone placeholder.
+    def _should_accept_group_message(self, message: Any, sender_id: Any, chat_id: str = "") -> bool:
+        """Require an explicit @mention before group messages enter the agent."""
+        if not self._allow_group_message(sender_id, chat_id):
+            return False
+        if chat_id and chat_id in self._free_response_chats:
+            return True
+        if not self._require_mention:
+            return True
+        # @_all is Feishu's @everyone placeholder — always route to the bot.
         raw_content = getattr(message, "content", "") or ""
         if "@_all" in raw_content:
             return True
